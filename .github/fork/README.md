@@ -185,6 +185,41 @@ fork 出来的仓库，GitHub 默认不会自动运行继承来的上游工作�
 
 另外，GitHub 会在**仓库连续 60 天没有任何活动**时自动停用 `schedule` 定时触发；届时手动跑一次任一工作流即可恢复。
 
-### 4. 上游仓库的其它工作流
+### 4. 可选但推荐：`FORK_SYNC_TOKEN`（让「同步 tag / 上游改 CI 文件」也能通过）
 
-fork 里同时存在上游自带的 21 个工作流（`ci.yml`、`release.yml` 等）。本方案不修改、不禁用它们；如果你不想让它们消耗额度或产生噪音通知，可以在 Actions 页面里逐个 Disable workflow。
+GitHub 对默认的 `GITHUB_TOKEN` 有一条硬限制：**不允许创建或更新包含 `.github/workflows/**` 变更的 ref**。实测现象：
+
+```text
+! [remote rejected] dsh-v0.1.0-rc.7 -> dsh-v0.1.0-rc.7
+  (refusing to allow a GitHub App to create or update workflow
+   `.github/workflows/build-exe-for-python-sdk.yml` without `workflows` permission)
+```
+
+影响面：
+- **tag 镜像**：只有不修改 workflow 文件的 tag 能推成功，其余会被拒绝（工作流会打 `::warning::`，不影响 master 同步）；
+- **master 同步**：绝大多数提交没问题；但只要上游那次更新**改动了 `.github/workflows/` 下的文件**，`GITHUB_TOKEN` 推送就会被拒，同步工作流会明确报错并给出修复指引。
+
+修复方式（一次性，30 秒）：
+
+1. 生成 token：
+   - 经典 PAT：勾选 `repo` + `workflow`；或
+   - 细粒度 PAT：仓库选 `sheying2013/deepseek-harness`，权限给 **Contents: Read and write** 与 **Workflows: Read and write**；
+2. 仓库 `Settings → Secrets and variables → Actions → New repository secret`，名称填 **`FORK_SYNC_TOKEN`**，值填上面生成的 token；
+3. 无需改代码——两个工作流已经在用 `secrets.FORK_SYNC_TOKEN || secrets.GITHUB_TOKEN` 的写法，加了 secret 就自动切换。
+
+> 不配这个 secret 也能用：master 同步在常见情况下正常工作，云编译照常跑；只是「上游改了 CI 文件的那一次同步」和「历史 tag 镜像」会失败并提示。
+
+### 5. 上游仓库的其它工作流
+
+fork 里同时存在上游自带的 21 个工作流（`ci.yml`、`release.yml`、`Sandbox` 等）。它们是给上游自己的基础设施用的，在这个 fork 里只会重复跑、报错并刷通知，因此**已经把除下面两个之外的全部上游工作流设为 disabled**：
+
+- ✅ 保持启用：`Sync Upstream & Trigger Build`（`fork-sync-upstream.yml`）
+- ✅ 保持启用：`Build macOS x64 Desktop App`（`fork-macos-x64.yml`）
+- ⏸️ 已停用：其余 19 个（`CI`、`CI master`、`Release (dsh)`、`Release (vendor)`、`Sandbox`、`E2E ...`、`Issue policy` 等）
+
+需要恢复任意一个：`Actions → 左侧选中该工作流 → 右上角 ⋯ → Enable workflow`；或者用命令行：
+
+```bash
+gh workflow list --all --repo sheying2013/deepseek-harness
+gh workflow enable "<workflow name>" --repo sheying2013/deepseek-harness
+```

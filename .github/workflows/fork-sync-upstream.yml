@@ -32,6 +32,11 @@ jobs:
         with:
           ref: master
           fetch-depth: 0
+          # GITHUB_TOKEN cannot push refs whose history changes files under
+          # .github/workflows. Set a FORK_SYNC_TOKEN repository secret (classic PAT
+          # with repo+workflow scopes, or fine-grained PAT with Contents: write and
+          # Workflows: write) to make master and tag mirroring work in all cases.
+          token: ${{ secrets.FORK_SYNC_TOKEN || secrets.GITHUB_TOKEN }}
 
       - name: Configure Git identity
         run: |
@@ -69,7 +74,12 @@ jobs:
             echo "New upstream commits detected. Merging $UPSTREAM_SHA into master..."
             git merge --no-edit "$UPSTREAM_SHA"
             echo "Pushing merged master to origin..."
-            git push origin HEAD:master
+            if ! git push origin HEAD:master; then
+              echo "::error::Failed to push the merged master."
+              echo "::error::If the git output above says 'without workflows permission', 'refusing to allow a GitHub App', or 'protected branch', this run used GITHUB_TOKEN."
+              echo "::error::Fix: create a repository secret FORK_SYNC_TOKEN - classic PAT with repo+workflow scopes, or fine-grained PAT with Contents: write and Workflows: write - then re-run this workflow."
+              exit 1
+            fi
             echo "changed=true" >> "$GITHUB_OUTPUT"
             echo "upstream_sha=$UPSTREAM_SHA" >> "$GITHUB_OUTPUT"
             CHANGED="true"
@@ -77,7 +87,10 @@ jobs:
 
           echo "Syncing tags from upstream..."
           if git fetch upstream --tags; then
-            git push origin --tags || echo "::warning::Failed to push some or all tags to origin"
+            if ! git push origin --tags; then
+              echo "::warning::Some upstream tags were not mirrored. GITHUB_TOKEN may not create tags whose commits add or change .github/workflows files."
+              echo "::warning::Master sync still succeeded; set FORK_SYNC_TOKEN to mirror every tag."
+            fi
           else
             echo "::warning::Failed to fetch tags from upstream"
           fi
