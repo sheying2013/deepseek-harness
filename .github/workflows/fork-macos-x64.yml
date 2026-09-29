@@ -1,0 +1,307 @@
+name: Build macOS x64 Desktop App
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Git ref to checkout (branch, tag, or SHA)'
+        required: false
+        default: 'master'
+        type: string
+      build_version:
+        description: 'Custom build version (leave empty for auto: <product>.<date>.<run_number>)'
+        required: false
+        default: ''
+        type: string
+      create_release:
+        description: 'Create a GitHub Release with DMG artifact'
+        required: false
+        default: true
+        type: boolean
+  workflow_call:
+    inputs:
+      ref:
+        description: 'Git ref to checkout (branch, tag, or SHA)'
+        required: false
+        default: 'master'
+        type: string
+      build_version:
+        description: 'Custom build version (leave empty for auto: <product>.<date>.<run_number>)'
+        required: false
+        default: ''
+        type: string
+      create_release:
+        description: 'Create a GitHub Release with DMG artifact'
+        required: false
+        default: true
+        type: boolean
+  repository_dispatch:
+    types: [build-macos-x64]
+
+concurrency:
+  group: build-macos-x64-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  actions: read
+
+env:
+  PRIMARY_NODE_VERSION: '24'
+  DSH_TELEMETRY_DISABLED: '1'
+  CI: 'true'
+
+jobs:
+  build-macos-x64:
+    name: Build macOS x64 (Intel)
+    runs-on: macos-15-intel
+    timeout-minutes: 300
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.event.client_payload.ref || 'master' }}
+          fetch-depth: 0
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node.js ${{ env.PRIMARY_NODE_VERSION }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.PRIMARY_NODE_VERSION }}
+          cache: 'pnpm'
+
+      - name: Apply fork unsigned-macOS patch
+        run: |
+          set -euo pipefail
+          PATCH=".github/fork/unsigned-macos-x64.patch"
+          test -f "$PATCH"
+          if git apply --check "$PATCH"; then
+            git apply "$PATCH"
+            echo "applied with git apply (exact context)"
+          else
+            echo "::warning::git apply --check failed, retrying with patch(1) fuzz"
+            patch -p1 --forward --fuzz=3 < "$PATCH"
+          fi
+          REJECTS=$(find apps/desktop/scripts -name '*.rej' -print)
+          if [ -n "$REJECTS" ]; then
+            echo "::error::patch produced rejects:"
+            echo "$REJECTS"
+            exit 1
+          fi
+          git diff --stat
+
+      - name: Verify fork patch markers
+        run: |
+          set -euo pipefail
+          grep -q "DSH_DESKTOP_UNSIGNED !== '1'" apps/desktop/scripts/prepare-dsh.ts
+          grep -q "name !== 'mac-x64'" apps/desktop/scripts/package-target.ts
+          grep -q "unsigned ? null : macOSSigning" apps/desktop/scripts/electron-builder-config.mjs
+          grep -q "unsigned artifacts require Windows or macOS" apps/desktop/scripts/smoke-packaged-runtime.ts
+          grep -q "unsigned ? buildPaths.unsignedArtifacts : buildPaths.artifacts" apps/desktop/scripts/package-target.ts
+          node --check apps/desktop/scripts/electron-builder-config.mjs
+          echo "All unsigned-macOS patch markers verified."
+
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          pnpm install --frozen-lockfile
+
+      - name: Generate apps/desktop/.env.macos
+        run: |
+          set -euo pipefail
+          {
+            echo "DSH_DESKTOP_APP_ID=com.deepseek.harness"
+            echo "DSH_DESKTOP_AUTO_UPDATE_ENV=test"
+            echo "DSH_DESKTOP_MANDATORY_UPDATE_TEST_ORIGIN=https://update-test.deepseek.com"
+            echo "DSH_DESKTOP_MANDATORY_UPDATE_PROD_ORIGIN=https://update.deepseek.com"
+            echo "DSH_DESKTOP_MANDATORY_UPDATE_CONFIG={\"allowedAuthOrigins\":[\"https://login.example.com\"]}"
+            echo "DSH_DESKTOP_MACOS_PACK_CONCURRENCY=4"
+            echo "DOWNLOAD_TEST_ORIGIN=https://download-test.deepseek.com"
+            echo "DOWNLOAD_TEST_RELEASE_ID=0123456789abcdef0123456789abcdef"
+          } > apps/desktop/.env.macos
+          echo "apps/desktop/.env.macos generated successfully."
+
+      - name: Resolve build version
+        id: version
+        run: |
+          set -euo pipefail
+          INPUT_VERSION="${{ inputs.build_version || github.event.client_payload.build_version || '' }}"
+          if [ -n "$INPUT_VERSION" ]; then
+            BUILD_VERSION="$INPUT_VERSION"
+          else
+            BUILD_VERSION=$(node --input-type=module -e "
+              import { readFileSync } from 'node:fs';
+              import { desktopBuildVersionPrefix } from './apps/desktop/scripts/desktop-build-version.mjs';
+              const pkg = JSON.parse(readFileSync('./apps/desktop/package.json', 'utf8'));
+              const prefix = desktopBuildVersionPrefix(pkg.version);
+              const now = new Date();
+              const dateStr = now.getUTCFullYear() + String(now.getUTCMonth() + 1).padStart(2, '0') + String(now.getUTCDate()).padStart(2, '0');
+              const runNum = process.env.GITHUB_RUN_NUMBER || '1';
+              console.log(\`\${prefix}\${dateStr}.\${runNum}\`);
+            ")
+          fi
+          echo "build_version=$BUILD_VERSION" >> "$GITHUB_OUTPUT"
+          echo "Resolved Build Version: $BUILD_VERSION"
+
+      - name: Validate packaging configuration and toolchain
+        run: |
+          set -euo pipefail
+          cd apps/desktop
+          pnpm run package:mac:x64 -- --unsigned --check --build-version "${{ steps.version.outputs.build_version }}"
+
+      - name: Package macOS x64 unsigned trial build
+        run: |
+          set -euo pipefail
+          cd apps/desktop
+          pnpm run package:mac:x64 -- --unsigned --build-version "${{ steps.version.outputs.build_version }}"
+
+      - name: Verify build artifacts
+        id: verify
+        run: |
+          set -euo pipefail
+          BUILD_VERSION="${{ steps.version.outputs.build_version }}"
+          UNSIGNED_DIR="apps/desktop/.desktop-build/targets/mac-x64/unsigned-artifacts"
+          APP_PATH="${UNSIGNED_DIR}/mac/DeepSeek Harness.app"
+          DMG_PATH="${UNSIGNED_DIR}/deepseek-harness-${BUILD_VERSION}-mac-x64-unsigned.dmg"
+
+          echo "==> 检查应用目录与 DMG 是否存在..."
+          if [ ! -d "$APP_PATH" ]; then
+            echo "::error::App bundle not found at $APP_PATH"
+            exit 1
+          fi
+          if [ ! -f "$DMG_PATH" ]; then
+            CANDIDATE=$(find "$UNSIGNED_DIR" -maxdepth 1 -name "*.dmg" | head -n 1)
+            if [ -n "$CANDIDATE" ] && [ -f "$CANDIDATE" ]; then
+              DMG_PATH="$CANDIDATE"
+              echo "Found alternative DMG: $DMG_PATH"
+            else
+              echo "::error::DMG not found at $DMG_PATH and no fallback .dmg found in $UNSIGNED_DIR"
+              ls -la "$UNSIGNED_DIR" || true
+              exit 1
+            fi
+          fi
+
+          echo "==> 1. 校验 DMG 完整性 (hdiutil verify)..."
+          /usr/bin/hdiutil verify "$DMG_PATH"
+
+          echo "==> 2. 检查主程序架构 (lipo -archs)..."
+          MAIN_BIN="$APP_PATH/Contents/MacOS/DeepSeek Harness"
+          if [ ! -f "$MAIN_BIN" ]; then
+            echo "::error::Main executable missing at $MAIN_BIN"
+            exit 1
+          fi
+          MAIN_ARCHS=$(/usr/bin/lipo -archs "$MAIN_BIN")
+          echo "Main binary archs: $MAIN_ARCHS"
+          if ! echo "$MAIN_ARCHS" | grep -qw "x86_64"; then
+            echo "::error::Main executable $MAIN_BIN does not contain x86_64! (Found: $MAIN_ARCHS)"
+            exit 1
+          fi
+
+          echo "==> 3. 检查内置 Node 运行时架构 (file)..."
+          NODE_BINS=$(find "$APP_PATH/Contents/Resources" -name "node" -type f)
+          if [ -z "$NODE_BINS" ]; then
+            echo "::error::No bundled node binary found in $APP_PATH/Contents/Resources"
+            exit 1
+          fi
+          while IFS= read -r node_bin; do
+            [ -z "$node_bin" ] && continue
+            echo "Checking $node_bin..."
+            BIN_DESC=$(file "$node_bin")
+            echo "  $BIN_DESC"
+            if ! echo "$BIN_DESC" | grep -q "x86_64"; then
+              echo "::error::Bundled node $node_bin is not x86_64! ($BIN_DESC)"
+              exit 1
+            fi
+          done <<< "$NODE_BINS"
+
+          echo "==> 4. 严格校验代码签名 (codesign --verify)..."
+          /usr/bin/codesign --verify --deep --strict --verbose=2 "$APP_PATH"
+
+          echo "==> 计算产物摘要..."
+          DMG_SHA256=$(shasum -a 256 "$DMG_PATH" | awk '{print $1}')
+          DMG_SIZE=$(ls -lh "$DMG_PATH" | awk '{print $5}')
+          DMG_NAME=$(basename "$DMG_PATH")
+
+          echo "dmg_path=$DMG_PATH" >> "$GITHUB_OUTPUT"
+          echo "dmg_name=$DMG_NAME" >> "$GITHUB_OUTPUT"
+          echo "dmg_sha256=$DMG_SHA256" >> "$GITHUB_OUTPUT"
+          echo "dmg_size=$DMG_SIZE" >> "$GITHUB_OUTPUT"
+          echo "main_archs=$MAIN_ARCHS" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "## macOS x86_64 构建验收报告 (Verification Report)"
+            echo ""
+            echo "- **构建版本 (Build Version)**: \`${BUILD_VERSION}\`"
+            echo "- **产物文件 (DMG)**: \`${DMG_NAME}\`"
+            echo "- **文件大小 (Size)**: \`${DMG_SIZE}\`"
+            echo "- **SHA256**: \`${DMG_SHA256}\`"
+            echo "- **主二进制架构**: \`${MAIN_ARCHS}\` (已验证包含 x86_64)"
+            echo "- **Node 运行时架构**: 已验证包含 x86_64"
+            echo "- **DMG 镜像校验**: \`hdiutil verify\` 通过"
+            echo "- **代码签名状态**: \`codesign --verify --deep --strict\` 通过 (ad-hoc)"
+            echo ""
+            echo "> ⚠️ **注意**：本版本为未签名/未公证本地试用包。首次安装后打开若遇 Gatekeeper 拦截，请在终端执行："
+            echo "> \`xattr -dr com.apple.quarantine \"/Applications/DeepSeek Harness.app\"\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload DMG artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: deepseek-harness-${{ steps.version.outputs.build_version }}-mac-x64-unsigned
+          path: ${{ steps.verify.outputs.dmg_path }}
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Create GitHub Release
+        if: always() && steps.verify.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_CREATE_RELEASE: ${{ inputs.create_release }}
+          PAYLOAD_CREATE_RELEASE: ${{ github.event.client_payload.create_release }}
+        run: |
+          set -euo pipefail
+          if [ "$INPUT_CREATE_RELEASE" = "false" ] || [ "$PAYLOAD_CREATE_RELEASE" = "false" ]; then
+            echo "Release creation disabled by input; skipping."
+            exit 0
+          fi
+
+          BUILD_VERSION="${{ steps.version.outputs.build_version }}"
+          TAG="macos-x64-v${BUILD_VERSION}"
+          DMG_PATH="${{ steps.verify.outputs.dmg_path }}"
+          DMG_NAME="${{ steps.verify.outputs.dmg_name }}"
+          DMG_SIZE="${{ steps.verify.outputs.dmg_size }}"
+          DMG_SHA256="${{ steps.verify.outputs.dmg_sha256 }}"
+
+          echo "Checking if release tag $TAG already exists..."
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "::notice::Release with tag $TAG already exists, skipping creation to prevent overwrite."
+          else
+            echo "Creating GitHub Release $TAG..."
+            RELEASE_NOTES=$(
+              echo "## DeepSeek Harness (macOS x86_64 Intel) - 本地试用包"
+              echo ""
+              echo "- **构建版本 (Build Version)**: \`${BUILD_VERSION}\`"
+              echo "- **文件名称 (Artifact)**: \`${DMG_NAME}\`"
+              echo "- **文件大小 (Size)**: \`${DMG_SIZE}\`"
+              echo "- **SHA256**: \`${DMG_SHA256}\`"
+              echo "- **构建环境**: GitHub Actions (\`macos-15-intel\`)"
+              echo "- **发布类型**: 预发布版 (Pre-release)"
+              echo ""
+              echo "### ⚠️ 重要使用说明（未公证/未签名包）"
+              echo "本产物为面向 macOS x86_64 (Intel) 平台的**未签名 / 未公证**本地测试试用包，非官方签名发布版本。"
+              echo ""
+              echo "由于未经 Apple 公证与开发者证书签名，直接双击打开可能提示「应用已损坏」或无法打开。"
+              echo "**首次使用安装后，请在终端执行以下命令清除隔离属性：**"
+              echo "\`\`\`bash"
+              echo "xattr -dr com.apple.quarantine \"/Applications/DeepSeek Harness.app\""
+              echo "\`\`\`"
+              echo "或者在访达中右键点击应用，按住 Option 键选择「打开」，并在确认弹窗中选择「打开」。"
+            )
+            gh release create "$TAG" "$DMG_PATH" \
+              --title "DeepSeek Harness ${BUILD_VERSION} (macOS x86_64)" \
+              --prerelease \
+              --notes "$RELEASE_NOTES"
+            echo "Release $TAG created successfully."
+          fi

@@ -1,0 +1,110 @@
+name: Sync Upstream & Trigger Build
+
+on:
+  schedule:
+    # 默认每 6 小时定时同步一次上游 master
+    - cron: '23 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      force_build:
+        description: 'Force trigger macOS x64 build even if no upstream changes'
+        required: false
+        default: false
+        type: boolean
+  repository_dispatch:
+    types: [sync-upstream]
+
+concurrency:
+  group: fork-sync-upstream
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  sync:
+    name: Sync Upstream Master & Tags
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork master
+        uses: actions/checkout@v4
+        with:
+          ref: master
+          fetch-depth: 0
+
+      - name: Configure Git identity
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Sync master and tags from upstream
+        id: sync
+        run: |
+          set -euo pipefail
+          UPSTREAM_REPO="https://github.com/deepseek-ai/deepseek-harness.git"
+
+          echo "Configuring upstream remote..."
+          if git remote get-url upstream >/dev/null 2>&1; then
+            git remote set-url upstream "$UPSTREAM_REPO"
+          else
+            git remote add upstream "$UPSTREAM_REPO"
+          fi
+
+          echo "Fetching upstream master..."
+          git fetch --no-tags upstream master
+
+          UPSTREAM_SHA=$(git rev-parse upstream/master)
+          LOCAL_SHA=$(git rev-parse HEAD)
+          echo "Upstream master SHA: $UPSTREAM_SHA"
+          echo "Local master SHA:    $LOCAL_SHA"
+
+          if git merge-base --is-ancestor "$UPSTREAM_SHA" HEAD; then
+            echo "Local master already contains upstream master ($UPSTREAM_SHA)."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "upstream_sha=$UPSTREAM_SHA" >> "$GITHUB_OUTPUT"
+            CHANGED="false"
+          else
+            echo "New upstream commits detected. Merging $UPSTREAM_SHA into master..."
+            git merge --no-edit "$UPSTREAM_SHA"
+            echo "Pushing merged master to origin..."
+            git push origin HEAD:master
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "upstream_sha=$UPSTREAM_SHA" >> "$GITHUB_OUTPUT"
+            CHANGED="true"
+          fi
+
+          echo "Syncing tags from upstream..."
+          if git fetch upstream --tags; then
+            git push origin --tags || echo "::warning::Failed to push some or all tags to origin"
+          else
+            echo "::warning::Failed to fetch tags from upstream"
+          fi
+
+          FORCE="${{ inputs.force_build || false }}"
+          TRIGGERED="false"
+          if [ "$CHANGED" = "true" ] || [ "$FORCE" = "true" ]; then
+            TRIGGERED="true"
+          fi
+          echo "triggered=$TRIGGERED" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "## 上游代码同步结果 (Upstream Sync Summary)"
+            echo ""
+            echo "- **上游仓库 (Upstream)**: \`deepseek-ai/deepseek-harness\`"
+            echo "- **上游 master 提交 (SHA)**: \`${UPSTREAM_SHA}\`"
+            echo "- **本地更新检测 (Changed)**: \`${CHANGED}\`"
+            echo "- **强制触发构建 (Force Build)**: \`${FORCE}\`"
+            echo "- **触发云编译 (Triggered)**: \`${TRIGGERED}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Trigger macOS x64 build workflow
+        if: steps.sync.outputs.triggered == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          echo "Dispatching fork-macos-x64.yml on master..."
+          gh workflow run fork-macos-x64.yml --repo "$GITHUB_REPOSITORY" --ref master
+          echo "Dispatched fork-macos-x64.yml successfully."
