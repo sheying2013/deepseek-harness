@@ -200,21 +200,39 @@ jobs:
           fi
 
           echo "==> 3. 检查内置 Node 运行时架构 (file)..."
+          # Contents/Resources/runtime/bin/node is a POSIX shell launcher, not a Mach-O
+          # binary, so only files that file(1) reports as Mach-O are arch-checked; at
+          # least one real Mach-O node binary must be present and must be x86_64.
           NODE_BINS=$(find "$APP_PATH/Contents/Resources" -name "node" -type f)
           if [ -z "$NODE_BINS" ]; then
             echo "::error::No bundled node binary found in $APP_PATH/Contents/Resources"
             exit 1
           fi
+          NODE_MACHO=0
           while IFS= read -r node_bin; do
             [ -z "$node_bin" ] && continue
             echo "Checking $node_bin..."
             BIN_DESC=$(file "$node_bin")
             echo "  $BIN_DESC"
-            if ! echo "$BIN_DESC" | grep -q "x86_64"; then
-              echo "::error::Bundled node $node_bin is not x86_64! ($BIN_DESC)"
-              exit 1
-            fi
+            case "$BIN_DESC" in
+              *Mach-O*)
+                if echo "$BIN_DESC" | grep -q "x86_64"; then
+                  NODE_MACHO=$((NODE_MACHO + 1))
+                else
+                  echo "::error::Bundled node $node_bin is Mach-O but not x86_64! ($BIN_DESC)"
+                  exit 1
+                fi
+                ;;
+              *)
+                echo "  -> not a Mach-O binary (launcher script); arch check not applicable"
+                ;;
+            esac
           done <<< "$NODE_BINS"
+          if [ "$NODE_MACHO" -lt 1 ]; then
+            echo "::error::No Mach-O node binary found under $APP_PATH/Contents/Resources; cannot confirm the bundled runtime architecture"
+            exit 1
+          fi
+          echo "Mach-O node binaries verified as x86_64: $NODE_MACHO"
 
           echo "==> 4. 严格校验代码签名 (codesign --verify)..."
           /usr/bin/codesign --verify --deep --strict --verbose=2 "$APP_PATH"
@@ -238,7 +256,7 @@ jobs:
             echo "- **文件大小 (Size)**: \`${DMG_SIZE}\`"
             echo "- **SHA256**: \`${DMG_SHA256}\`"
             echo "- **主二进制架构**: \`${MAIN_ARCHS}\` (已验证包含 x86_64)"
-            echo "- **Node 运行时架构**: 已验证包含 x86_64"
+            echo "- **内置 Node 运行时 (Mach-O)**: 已验证 ${NODE_MACHO} 个二进制均为 x86_64"
             echo "- **DMG 镜像校验**: \`hdiutil verify\` 通过"
             echo "- **代码签名状态**: \`codesign --verify --deep --strict\` 通过 (ad-hoc)"
             echo ""
