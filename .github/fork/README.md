@@ -150,30 +150,28 @@ fork 的 `master` 只在上游代码之外多出以下文件，上游永远不�
 | :--- | :--- |
 | `.github/workflows/fork-sync-upstream.yml` | 上游同步工作流 |
 | `.github/workflows/fork-macos-x64.yml` | macOS x64 云编译工作流 |
-| `.github/fork/unsigned-macos-x64.patch` | 唯一一处源码改动：放开上游「macOS 不允许 `--unsigned`」的限制 |
 | `.github/fork/README.md` | 本说明 |
 
-**为什么用补丁文件而不是直接改源码？** 上游官方打包流程强制要求 Apple Developer ID 签名与公证（`forceCodeSigning: true`），fork 里没有证书，所以必须放开未签名模式。把改动存成补丁、由编译工作流在构建前 `git apply`，可以让 `master` 始终等于「上游 + CI 文件」，同步永远是快进/无冲突合并。
+**不需要改上游源码。** 自 `v0.2.1-alpha.2` 起，上游已经原生支持 macOS 未签名构建（`--unsigned`）：
 
-#### 补丁失效怎么办（唯一的已知失效点）
-如果上游某次更新改动了 `apps/desktop/scripts/` 下这四个文件的相关代码，补丁可能应用失败，此时**同步仍然成功**，但云编译会在 `Apply fork unsigned-macOS patch` 步骤报错中止（并提示 reject/上下文不符），不会有半成品产物。
+- `electron-builder-config.mjs`：`identity: unsigned ? '-' : ...`、`notarize: !unsigned`、`target: unsigned ? ['dmg'] : ['dmg','zip']`、产物写入 `unsigned-artifacts/`；
+- `package-target.ts`：`--unsigned` 已允许 macOS 目标，产物目录切到 `unsigned-artifacts`；
+- `prepare-dsh.ts`：`DSH_DESKTOP_UNSIGNED=1` 时跳过原生 runtime 签名；
+- `smoke-packaged-runtime.ts`：未签名产物走 `unsigned-artifacts` 路径。
 
-修复方式（本地一条命令即可重新生成补丁）：
+因此 fork 里**不再需要任何源码补丁**，`master` 始终等于「上游 + 少量 CI 文件」，上游同步永远是快进/无冲突合并。
 
-```bash
-git clone https://github.com/sheying2013/deepseek-harness && cd deepseek-harness
-git remote add upstream https://github.com/deepseek-ai/deepseek-harness.git
-git fetch upstream master && git checkout -b tmp upstream/master
-# 手工按 .github/fork/unsigned-macos-x64.patch 的内容改这四个文件：
-#   apps/desktop/scripts/package-target.ts
-#   apps/desktop/scripts/prepare-dsh.ts
-#   apps/desktop/scripts/electron-builder-config.mjs
-#   apps/desktop/scripts/smoke-packaged-runtime.ts
-git diff > .github/fork/unsigned-macos-x64.patch   # 覆盖旧补丁
-git commit -am "ci: refresh unsigned-macos-x64 patch" && git push origin HEAD:master
-```
+#### 关于 ad-hoc 重签（fork 独有的一步）
 
-编译工作流里还有一步 `Verify fork patch markers`，会对四处关键改动做语义断言（例如 `prepare-dsh.ts` 必须含 `DSH_DESKTOP_UNSIGNED !== '1'`），即使 `patch(1)` 带 fuzz 应用成功也必须通过断言，杜绝「补丁错位但构建照跑」的情况。
+上游的未签名模式用 `identity: '-'` 让 electron-builder 做 ad-hoc 签名，但打包过程会改写 `Contents/Resources/app.asar.unpacked/dsh` 与 `runtime/primary-runtime`，这些路径在 `signIgnore` 名单里不会被重新封装，导致 `codesign --verify --deep --strict` 可能失败。
+
+所以编译工作流在打包之后、验收之前增加了一步 `Ad-hoc re-sign app bundle and rebuild DMG`：
+
+1. `/usr/bin/codesign --force --deep --sign - "<app>"` —— 对整个 App bundle 做深度 ad-hoc 重签；
+2. `/usr/bin/codesign --verify --deep --strict --verbose=2 "<app>"` —— 立即自证签名链有效；
+3. `/usr/bin/hdiutil create -volname "DeepSeek Harness" -srcfolder "<app>" -format UDZO -ov "<dmg>"` —— 用重签后的 App 重建 DMG（这一步只在 CI 里做，不碰上游源码）。
+
+以后上游如果再次改动未签名相关逻辑，只会影响这一条 CI 步骤，不会再出现「补丁错位导致编译中止」。
 
 ### 3. 首次启用（fork 的 Actions 需要手动放行一次）
 

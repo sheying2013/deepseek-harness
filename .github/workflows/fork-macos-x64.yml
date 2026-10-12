@@ -72,37 +72,6 @@ jobs:
           node-version: ${{ env.PRIMARY_NODE_VERSION }}
           cache: 'pnpm'
 
-      - name: Apply fork unsigned-macOS patch
-        run: |
-          set -euo pipefail
-          PATCH=".github/fork/unsigned-macos-x64.patch"
-          test -f "$PATCH"
-          if git apply --check "$PATCH"; then
-            git apply "$PATCH"
-            echo "applied with git apply (exact context)"
-          else
-            echo "::warning::git apply --check failed, retrying with patch(1) fuzz"
-            patch -p1 --forward --fuzz=3 < "$PATCH"
-          fi
-          REJECTS=$(find apps/desktop/scripts -name '*.rej' -print)
-          if [ -n "$REJECTS" ]; then
-            echo "::error::patch produced rejects:"
-            echo "$REJECTS"
-            exit 1
-          fi
-          git diff --stat
-
-      - name: Verify fork patch markers
-        run: |
-          set -euo pipefail
-          grep -q "DSH_DESKTOP_UNSIGNED !== '1'" apps/desktop/scripts/prepare-dsh.ts
-          grep -q "name !== 'mac-x64'" apps/desktop/scripts/package-target.ts
-          grep -q "unsigned ? null : macOSSigning" apps/desktop/scripts/electron-builder-config.mjs
-          grep -q "unsigned artifacts require Windows or macOS" apps/desktop/scripts/smoke-packaged-runtime.ts
-          grep -q "unsigned ? buildPaths.unsignedArtifacts : buildPaths.artifacts" apps/desktop/scripts/package-target.ts
-          node --check apps/desktop/scripts/electron-builder-config.mjs
-          echo "All unsigned-macOS patch markers verified."
-
       - name: Install dependencies
         run: |
           set -euo pipefail
@@ -156,6 +125,43 @@ jobs:
           set -euo pipefail
           cd apps/desktop
           pnpm run package:mac:x64 -- --unsigned --build-version "${{ steps.version.outputs.build_version }}"
+
+      - name: Ad-hoc re-sign app bundle and rebuild DMG
+        run: |
+          set -euo pipefail
+          BUILD_VERSION="${{ steps.version.outputs.build_version }}"
+          UNSIGNED_DIR="apps/desktop/.desktop-build/targets/mac-x64/unsigned-artifacts"
+          APP_PATH="${UNSIGNED_DIR}/mac/DeepSeek Harness.app"
+          DMG_PATH="${UNSIGNED_DIR}/deepseek-harness-${BUILD_VERSION}-mac-x64-unsigned.dmg"
+
+          echo "==> 定位 electron-builder 未签名产物..."
+          if [ ! -d "$APP_PATH" ]; then
+            echo "::error::App bundle not found at $APP_PATH"
+            find "$UNSIGNED_DIR" -maxdepth 3 -name "*.app" -print 2>/dev/null || true
+            exit 1
+          fi
+          if [ ! -f "$DMG_PATH" ]; then
+            CANDIDATE=$(find "$UNSIGNED_DIR" -maxdepth 1 -name "*.dmg" | head -n 1)
+            if [ -n "$CANDIDATE" ]; then
+              echo "Using DMG produced by electron-builder: $CANDIDATE"
+              DMG_PATH="$CANDIDATE"
+            else
+              echo "::error::electron-builder did not produce a DMG under $UNSIGNED_DIR"
+              ls -la "$UNSIGNED_DIR" || true
+              exit 1
+            fi
+          fi
+
+          echo "==> 清理扩展属性后做 ad-hoc 深度重签（修复内置 runtime 被改写导致的签名失效）..."
+          /usr/bin/xattr -cr "$APP_PATH"
+          /usr/bin/codesign --force --deep --sign - "$APP_PATH"
+          /usr/bin/codesign --verify --deep --strict --verbose=2 "$APP_PATH"
+          echo "codesign --verify --deep --strict: PASS"
+
+          echo "==> 用重签后的 App 重建 DMG..."
+          /bin/rm -f "$DMG_PATH"
+          /usr/bin/hdiutil create -volname "DeepSeek Harness" -srcfolder "$APP_PATH" -format UDZO -ov "$DMG_PATH"
+          echo "Rebuilt DMG: $DMG_PATH"
 
       - name: Verify build artifacts
         id: verify
