@@ -1,8 +1,8 @@
 # DeepSeek Harness Fork 自动同步与 macOS x86_64 云编译流水线
 
 本项目为 `sheying2013/deepseek-harness`（fork 自 `deepseek-ai/deepseek-harness`）配置了双 GitHub Actions 工作流体系，实现：
-1. **上游代码与标签自动同步**：定时检测并合并上游 `master` 与 tags，发现新提交时自动调度编译；
-2. **macOS x86_64 自动化云编译与发布**：在 GitHub 官方 `macos-15-intel` 真实 x64 环境上构建未签名/未公证本地试用包，执行四重完整性验收，并自动上传 Artifact 与创建 GitHub Release。
+1. **上游代码、标签与 Release 自动同步**：每 10 分钟轮询上游 `master`、tags 和 DSH Releases（含 prerelease）；
+2. **每个新上游 DSH Release 自动云编译**：在 `macos-15-intel` 上按发布日期排队构建 x86_64 试用包，验收通过后自动上传 Artifact 并创建 fork Release。
 
 ---
 
@@ -10,28 +10,21 @@
 
 | 工作流文件 | 显示名称 | 运行环境 | 默认触发方式 | 核心职责 |
 | :--- | :--- | :--- | :--- | :--- |
-| `fork-sync-upstream.yml` | `Sync Upstream & Trigger Build` | `ubuntu-latest` | 每 6 小时定时 / 手动 `workflow_dispatch` / `repository_dispatch` | 同步上游代码与标签；检测到更新时触发编译 |
-| `fork-macos-x64.yml` | `Build macOS x64 Desktop App` | `macos-15-intel` | 手动 `workflow_dispatch` / 工作流调用 `workflow_call` / 上游同步后自动调度 | 自动化构建、四重验收、Artifact 保存与 Release 发布 |
+| `fork-sync-upstream.yml` | `Sync Upstream & Trigger Build` | `ubuntu-latest` | 每 10 分钟 / 手动 `workflow_dispatch` / `repository_dispatch` | 同步 master/tags，轮询上游 DSH Releases，并排队调用 x64 构建 |
+| `fork-macos-x64.yml` | `Build macOS x64 Desktop App` | `macos-15-intel` | 手动 `workflow_dispatch` / 可复用 `workflow_call` | 构建指定上游 Release tag、四重验收、Artifact 与 fork Release 发布 |
 
 ---
 
 ## 二、工作流详细说明
 
-### 1. `fork-sync-upstream.yml`（上游同步与调度）
+### 1. `fork-sync-upstream.yml`（上游同步与 Release 构建队列）
 
-- **工作机制**：
-  1. 通过 `actions/checkout@v4` 拉取 fork 仓库的 `master` 分支完整历史（`fetch-depth: 0`）。
-  2. 配置上游远程地址 `https://github.com/deepseek-ai/deepseek-harness.git` 并拉取 `upstream/master`。
-  3. 执行 `git merge-base --is-ancestor "$UPSTREAM_SHA" HEAD` 比较分支状态：
-     - 若本地已包含上游最新提交，标记 `changed=false`；
-     - 若上游存在新提交，执行 `git merge --no-edit "$UPSTREAM_SHA"` 并推送至 fork 的 `master`。
-  4. 同步上游的所有 Git Tags（`git fetch upstream --tags` && `git push origin --tags`）。
-  5. 若有代码更新（或手动触发勾选了 `force_build`），显式调用 GitHub CLI：
-     ```bash
-     gh workflow run fork-macos-x64.yml --repo "$GITHUB_REPOSITORY" --ref master
-     ```
-- **关键设计：同步触发链**：
-  GitHub Actions 安全机制明确规定：由默认 `GITHUB_TOKEN` 推送产生的 `push` 事件**不会**触发仓库中的其他 Workflow（防止自动化循环风暴）。因此，同步工作流在检测到代码变动后，通过具备 `actions: write` 权限的 `GITHUB_TOKEN` 显式调用 `gh workflow run` 触发编译工作流，确保链路打通。
+- 每 **10 分钟**运行一次；GitHub 不会把上游仓库的 `release` 事件直接转发给 fork，因此用轮询发现新发布，通常 10 分钟内启动。
+- 合并上游 `master` 并镜像上游 tags。准备构建前会确认 release tag 已同步到 fork。
+- 查询上游所有已发布的 `dsh-v*` Release（包括 prerelease），以 fork 中**最新一个已成功生成 DMG 的版本**为检查点，只选择其后的第一个发布版本。
+- 通过 `workflow_call` 直接运行下方 macOS 构建工作流；每个版本串行构建。构建成功并创建 DMG Release 后，下一次轮询才会推进到下一版本；失败的版本会留在队列头部并自动重试。
+- 若历史 fork 中没有可识别的成功 DMG 检查点，工作流会 fail closed，不猜测、不一次性补构建全部旧版本。
+- 手动运行可勾选 `force_build`，强制重建上游最新的 `dsh-v*` 发布版本。
 
 ### 2. `fork-macos-x64.yml`（macOS x86_64 云编译与打包）
 
@@ -59,19 +52,19 @@
 
 ## 三、操作指引
 
-### 1. 手动触发上游同步与构建
+### 1. 手动触发上游同步与 Release 构建
 - **Web UI 界面操作**：
   1. 进入仓库页面，点击顶部导航栏的 **Actions**；
   2. 在左侧工作流列表中选择 **`Sync Upstream & Trigger Build`**；
   3. 点击右侧 **Run workflow** 下拉按钮；
-  4. 可选择是否勾选 `Force trigger macOS x64 build even if no upstream changes`（即使上游无更新也强制构建）；
+  4. 通常不勾选 `force_build`；勾选后会强制重建上游最新的 DSH Release；
   5. 点击绿色 **Run workflow** 按钮启动。
 - **GitHub CLI 命令行操作**：
   ```bash
-  # 普通同步（仅在发现上游更新时触发编译）
+  # 立即检查上游；若有新 Release，自动构建队列中的下一个版本
   gh workflow run fork-sync-upstream.yml --ref master
 
-  # 强制同步并立即触发云编译
+  # 强制重建上游最新 DSH Release
   gh workflow run fork-sync-upstream.yml --ref master -f force_build=true
   ```
 
@@ -127,19 +120,16 @@ xattr -dr com.apple.quarantine "/Applications/DeepSeek Harness.app"
 
 ## 六、进阶配置与常见问题
 
-### 1. 修改定时同步频率（Cron）
-在 `.github/workflows/fork-sync-upstream.yml` 中修改 `schedule.cron` 字段：
+### 1. 修改上游 Release 检查频率（Cron）
+默认每 10 分钟轮询一次，以便在上游发布后尽快开始构建。可在 `.github/workflows/fork-sync-upstream.yml` 中修改 `schedule.cron` 字段：
 ```yaml
 on:
   schedule:
-    # 示例 1：默认每 6 小时运行一次（第 23 分钟）
-    - cron: '23 */6 * * *'
+    # 默认每 10 分钟轮询上游 DSH Releases（含 prerelease）
+    - cron: '*/10 * * * *'
 
-    # 示例 2：每 2 小时运行一次
-    # - cron: '0 */2 * * *'
-
-    # 示例 3：每天凌晨 3 点运行一次 (UTC 时间)
-    # - cron: '0 3 * * *'
+    # 示例：每小时运行一次
+    # - cron: '0 * * * *'
 ```
 
 ### 2. `master` 分支持有的文件（fork 专属，不会被上游覆盖）
@@ -203,16 +193,16 @@ GitHub 对默认的 `GITHUB_TOKEN` 有一条硬限制：**不允许创建或更�
    - 经典 PAT：勾选 `repo` + `workflow`；或
    - 细粒度 PAT：仓库选 `sheying2013/deepseek-harness`，权限给 **Contents: Read and write** 与 **Workflows: Read and write**；
 2. 仓库 `Settings → Secrets and variables → Actions → New repository secret`，名称填 **`FORK_SYNC_TOKEN`**，值填上面生成的 token；
-3. 无需改代码——两个工作流已经在用 `secrets.FORK_SYNC_TOKEN || secrets.GITHUB_TOKEN` 的写法，加了 secret 就自动切换。
+3. 无需改代码——上游同步工作流已使用 `secrets.FORK_SYNC_TOKEN || secrets.GITHUB_TOKEN`，加了 secret 就自动切换。该 PAT 也用于下游 reusable workflow 构建及创建 fork Release。
 
-> 不配这个 secret 也能用：master 同步在常见情况下正常工作，云编译照常跑；只是「上游改了 CI 文件的那一次同步」和「历史 tag 镜像」会失败并提示。
+> 不配置这个 secret，GitHub 默认 `GITHUB_TOKEN` 可能无法推送包含 `.github/workflows/**` 变更的提交/tag，或触发下游 Actions；自动链路就可能失败。
 
 ### 5. 上游仓库的其它工作流
 
 fork 里同时存在上游自带的 21 个工作流（`ci.yml`、`release.yml`、`Sandbox` 等）。它们是给上游自己的基础设施用的，在这个 fork 里只会重复跑、报错并刷通知，因此**已经把除下面两个之外的全部上游工作流设为 disabled**：
 
 - ✅ 保持启用：`Sync Upstream & Trigger Build`（`fork-sync-upstream.yml`）
-- ✅ 保持启用：`Build macOS x64 Desktop App`（`fork-macos-x64.yml`）
+- ⚙️ 由同步工作流通过 `workflow_call` 调用：`Build macOS x64 Desktop App`（`fork-macos-x64.yml`）；不要手动 Disable，否则手动 `workflow_dispatch` 将不可用
 - ⏸️ 已停用：其余 19 个（`CI`、`CI master`、`Release (dsh)`、`Release (vendor)`、`Sandbox`、`E2E ...`、`Issue policy` 等）
 
 需要恢复任意一个：`Actions → 左侧选中该工作流 → 右上角 ⋯ → Enable workflow`；或者用命令行：

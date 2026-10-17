@@ -281,7 +281,7 @@ jobs:
       - name: Create GitHub Release
         if: always() && steps.verify.outcome == 'success'
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.FORK_SYNC_TOKEN || secrets.GITHUB_TOKEN }}
           INPUT_CREATE_RELEASE: ${{ inputs.create_release }}
           PAYLOAD_CREATE_RELEASE: ${{ github.event.client_payload.create_release }}
         run: |

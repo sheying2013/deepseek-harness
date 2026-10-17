@@ -2,12 +2,12 @@ name: Sync Upstream & Trigger Build
 
 on:
   schedule:
-    # 默认每 6 小时定时同步一次上游 master
-    - cron: '23 */6 * * *'
+    # 轮询上游发布（含 prerelease）；每 10 分钟检查一次，构建结束后继续排队下一版本
+    - cron: '*/10 * * * *'
   workflow_dispatch:
     inputs:
       force_build:
-        description: 'Force trigger macOS x64 build even if no upstream changes'
+        description: 'Force rebuild the latest published upstream DSH release'
         required: false
         default: false
         type: boolean
@@ -24,8 +24,11 @@ permissions:
 
 jobs:
   sync:
-    name: Sync Upstream Master & Tags
+    name: Sync Upstream Master & Release Queue
     runs-on: ubuntu-latest
+    outputs:
+      triggered: ${{ steps.sync.outputs.triggered }}
+      release_tag: ${{ steps.sync.outputs.release_tag }}
     steps:
       - name: Checkout fork master
         uses: actions/checkout@v4
@@ -44,11 +47,14 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-      - name: Sync master and tags from upstream
+      - name: Sync upstream master/tags and find an unbuilt release
         id: sync
+        env:
+          GH_TOKEN: ${{ secrets.FORK_SYNC_TOKEN || secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           UPSTREAM_REPO="https://github.com/deepseek-ai/deepseek-harness.git"
+          FORK_REPO="$GITHUB_REPOSITORY"
 
           echo "Configuring upstream remote..."
           if git remote get-url upstream >/dev/null 2>&1; then
@@ -57,67 +63,110 @@ jobs:
             git remote add upstream "$UPSTREAM_REPO"
           fi
 
-          echo "Fetching upstream master..."
+          echo "Fetching upstream master and release tags..."
           git fetch --no-tags upstream master
-
           UPSTREAM_SHA=$(git rev-parse upstream/master)
           LOCAL_SHA=$(git rev-parse HEAD)
           echo "Upstream master SHA: $UPSTREAM_SHA"
           echo "Local master SHA:    $LOCAL_SHA"
 
-          if git merge-base --is-ancestor "$UPSTREAM_SHA" HEAD; then
-            echo "Local master already contains upstream master ($UPSTREAM_SHA)."
-            echo "changed=false" >> "$GITHUB_OUTPUT"
-            echo "upstream_sha=$UPSTREAM_SHA" >> "$GITHUB_OUTPUT"
-            CHANGED="false"
-          else
-            echo "New upstream commits detected. Merging $UPSTREAM_SHA into master..."
+          CHANGED="false"
+          if ! git merge-base --is-ancestor "$UPSTREAM_SHA" HEAD; then
+            echo "Merging upstream master $UPSTREAM_SHA..."
             git merge --no-edit "$UPSTREAM_SHA"
-            echo "Pushing merged master to origin..."
-            if ! git push origin HEAD:master; then
-              echo "::error::Failed to push the merged master."
-              echo "::error::If the git output above says 'without workflows permission', 'refusing to allow a GitHub App', or 'protected branch', this run used GITHUB_TOKEN."
-              echo "::error::Fix: create a repository secret FORK_SYNC_TOKEN - classic PAT with repo+workflow scopes, or fine-grained PAT with Contents: write and Workflows: write - then re-run this workflow."
+            git push origin HEAD:master
+            CHANGED="true"
+          else
+            echo "Fork master already contains upstream master."
+          fi
+
+          # The build job checks out the release tag from the fork. Mirror tags before dispatch.
+          git fetch upstream --tags
+          git push origin --tags
+
+          echo "Querying published upstream releases (including prereleases)..."
+          UPSTREAM_RELEASES=$(gh api --paginate repos/deepseek-ai/deepseek-harness/releases \
+            --jq '.[] | select(.draft == false and .published_at != null and (.tag_name | startswith("dsh-v"))) | [.published_at, .tag_name] | @tsv' | sort)
+          FORK_BUILD_RELEASES=$(gh api --paginate "repos/${FORK_REPO}/releases" \
+            --jq '.[] | [.tag_name, ([.assets[].name | select(endswith(".dmg"))] | length)] | @tsv')
+
+          CANDIDATE_TAG=""
+          CANDIDATE_VERSION=""
+          FORCE="${{ inputs.force_build || false }}"
+          if [ "$FORCE" = "true" ]; then
+            # A manual force run rebuilds the newest published upstream DSH release.
+            CANDIDATE_TAG=$(printf '%s\n' "$UPSTREAM_RELEASES" | sort -r | head -n 1 | cut -f2)
+          else
+            # Treat the newest upstream DSH release that already has a DMG in this fork
+            # as the checkpoint. Only process releases published after it; this avoids
+            # backfilling old releases that predate this automation.
+            LAST_BUILT_INDEX=-1
+            LAST_BUILT_TAG=""
+            RELEASE_INDEX=0
+            while IFS=$'\t' read -r published_at release_tag; do
+              [ -z "$release_tag" ] && continue
+              release_version="${release_tag#dsh-v}"
+              if printf '%s\n' "$FORK_BUILD_RELEASES" | awk -F '\t' -v prefix="macos-x64-v${release_version}." '$1 ~ /^macos-x64-v/ && $2 > 0 { if (index($1, prefix) == 1) found=1 } END { exit !found }'; then
+                LAST_BUILT_INDEX=$RELEASE_INDEX
+                LAST_BUILT_TAG="$release_tag"
+              fi
+              RELEASE_INDEX=$((RELEASE_INDEX + 1))
+            done <<< "$UPSTREAM_RELEASES"
+
+            if [ "$LAST_BUILT_INDEX" -lt 0 ]; then
+              echo "::error::Cannot find an upstream DSH release matching an existing macOS DMG release; refusing to guess the release checkpoint."
               exit 1
             fi
-            echo "changed=true" >> "$GITHUB_OUTPUT"
-            echo "upstream_sha=$UPSTREAM_SHA" >> "$GITHUB_OUTPUT"
-            CHANGED="true"
+            echo "Latest upstream DSH release already built: $LAST_BUILT_TAG (index $LAST_BUILT_INDEX)"
+
+            RELEASE_INDEX=0
+            while IFS=$'\t' read -r published_at release_tag; do
+              [ -z "$release_tag" ] && continue
+              if [ "$RELEASE_INDEX" -gt "$LAST_BUILT_INDEX" ]; then
+                CANDIDATE_TAG="$release_tag"
+                break
+              fi
+              RELEASE_INDEX=$((RELEASE_INDEX + 1))
+            done <<< "$UPSTREAM_RELEASES"
           fi
 
-          echo "Syncing tags from upstream..."
-          if git fetch upstream --tags; then
-            if ! git push origin --tags; then
-              echo "::warning::Some upstream tags were not mirrored. GITHUB_TOKEN may not create tags whose commits add or change .github/workflows files."
-              echo "::warning::Master sync still succeeded; set FORK_SYNC_TOKEN to mirror every tag."
-            fi
-          else
-            echo "::warning::Failed to fetch tags from upstream"
+          CANDIDATE_VERSION=""
+          if [ -n "$CANDIDATE_TAG" ]; then
+            CANDIDATE_VERSION=$(git show "${CANDIDATE_TAG}:apps/desktop/package.json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["version"])')
           fi
 
-          FORCE="${{ inputs.force_build || false }}"
+          # Workflow-level concurrency serializes polling and the reusable build job.
+          # A failed build leaves the DMG checkpoint unchanged, so the same tag retries next poll.
           TRIGGERED="false"
-          if [ "$CHANGED" = "true" ] || [ "$FORCE" = "true" ]; then
+          if [ -n "$CANDIDATE_TAG" ]; then
             TRIGGERED="true"
+          else
+            echo "No upstream release is waiting for a macOS x64 build."
           fi
-          echo "triggered=$TRIGGERED" >> "$GITHUB_OUTPUT"
 
+          echo "changed=$CHANGED" >> "$GITHUB_OUTPUT"
+          echo "upstream_sha=$UPSTREAM_SHA" >> "$GITHUB_OUTPUT"
+          echo "release_tag=$CANDIDATE_TAG" >> "$GITHUB_OUTPUT"
+          echo "release_version=$CANDIDATE_VERSION" >> "$GITHUB_OUTPUT"
+          echo "triggered=$TRIGGERED" >> "$GITHUB_OUTPUT"
           {
-            echo "## 上游代码同步结果 (Upstream Sync Summary)"
-            echo ""
-            echo "- **上游仓库 (Upstream)**: \`deepseek-ai/deepseek-harness\`"
-            echo "- **上游 master 提交 (SHA)**: \`${UPSTREAM_SHA}\`"
-            echo "- **本地更新检测 (Changed)**: \`${CHANGED}\`"
-            echo "- **强制触发构建 (Force Build)**: \`${FORCE}\`"
-            echo "- **触发云编译 (Triggered)**: \`${TRIGGERED}\`"
+            echo "## 上游发布同步与 macOS x64 构建队列"
+            echo "- 上游 master: \`$UPSTREAM_SHA\`"
+            echo "- master 是否有更新: \`$CHANGED\`"
+            echo "- 本轮待构建发布: \`${CANDIDATE_TAG:-无}\`"
+            echo "- 产品版本: \`${CANDIDATE_VERSION:-无}\`"
+            echo "- 是否触发构建: \`$TRIGGERED\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Trigger macOS x64 build workflow
-        if: steps.sync.outputs.triggered == 'true'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          echo "Dispatching fork-macos-x64.yml on master..."
-          gh workflow run fork-macos-x64.yml --repo "$GITHUB_REPOSITORY" --ref master
-          echo "Dispatched fork-macos-x64.yml successfully."
+  build-release:
+    name: Build the next upstream DSH release (macOS x64)
+    needs: sync
+    if: needs.sync.outputs.triggered == 'true'
+    permissions:
+      contents: write
+      actions: read
+    uses: ./.github/workflows/fork-macos-x64.yml
+    with:
+      ref: ${{ needs.sync.outputs.release_tag }}
+      create_release: true
+    secrets: inherit
