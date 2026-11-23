@@ -6,6 +6,11 @@ on:
     - cron: '*/10 * * * *'
   workflow_dispatch:
     inputs:
+      release_tag:
+        description: 'Specific upstream DSH release tag to build (e.g. dsh-v0.2.3-alpha.2), or empty for automatic queue'
+        required: false
+        default: ''
+        type: string
       force_build:
         description: 'Force rebuild the latest published upstream DSH release'
         required: false
@@ -92,8 +97,12 @@ jobs:
 
           CANDIDATE_TAG=""
           CANDIDATE_VERSION=""
+          TARGET_TAG="${{ inputs.release_tag || '' }}"
           FORCE="${{ inputs.force_build || false }}"
-          if [ "$FORCE" = "true" ]; then
+          if [ -n "$TARGET_TAG" ]; then
+            echo "Target release tag specified: $TARGET_TAG"
+            CANDIDATE_TAG="$TARGET_TAG"
+          elif [ "$FORCE" = "true" ]; then
             # A manual force run rebuilds the newest published upstream DSH release.
             CANDIDATE_TAG=$(printf '%s\n' "$UPSTREAM_RELEASES" | sort -r | head -n 1 | cut -f2)
           else

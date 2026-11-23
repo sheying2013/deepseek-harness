@@ -158,10 +158,36 @@ jobs:
           /usr/bin/codesign --verify --deep --strict --verbose=2 "$APP_PATH"
           echo "codesign --verify --deep --strict: PASS"
 
+          echo "==> 确保卸载任何残留挂载卷与释放文件锁..."
+          for dev in $(/usr/bin/hdiutil info 2>/dev/null | awk '/\/Volumes\/DeepSeek/ {print $1}'); do
+            echo "Detaching stale volume: $dev"
+            /usr/bin/hdiutil detach "$dev" -force 2>/dev/null || true
+          done
+          sleep 3
+
           echo "==> 用重签后的 App 重建 DMG..."
-          /bin/rm -f "$DMG_PATH"
-          /usr/bin/hdiutil create -volname "DeepSeek Harness" -srcfolder "$APP_PATH" -format UDZO -ov "$DMG_PATH"
-          echo "Rebuilt DMG: $DMG_PATH"
+          REBUILT=0
+          for attempt in 1 2 3 4 5; do
+            echo "hdiutil create attempt $attempt..."
+            for dev in $(/usr/bin/hdiutil info 2>/dev/null | awk '/\/Volumes\/DeepSeek/ {print $1}'); do
+              /usr/bin/hdiutil detach "$dev" -force 2>/dev/null || true
+            done
+            TMP_DMG="${UNSIGNED_DIR}/tmp_rebuilt_${attempt}.dmg"
+            /bin/rm -f "$TMP_DMG" "$DMG_PATH"
+            sleep 2
+            if /usr/bin/hdiutil create -volname "DeepSeek Harness" -srcfolder "$APP_PATH" -format UDZO -ov "$TMP_DMG"; then
+              /bin/mv -f "$TMP_DMG" "$DMG_PATH"
+              echo "Rebuilt DMG: $DMG_PATH"
+              REBUILT=1
+              break
+            fi
+            echo "Attempt $attempt failed with code $?, retrying in 5s..."
+            sleep 5
+          done
+          if [ "$REBUILT" -ne 1 ]; then
+            echo "::error::Failed to create DMG after 5 attempts"
+            exit 1
+          fi
 
       - name: Verify build artifacts
         id: verify
