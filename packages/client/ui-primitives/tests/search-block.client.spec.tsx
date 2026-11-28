@@ -2,10 +2,10 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
-import { DEFAULT_SEARCH_MAX_LINES, SearchBlock as LocalizedSearchBlock } from '../src/index.ts'
+import { DEFAULT_SEARCH_MAX_LINES, SearchBlock as LocalizedSearchBlock } from '../src/client/index.ts'
 import type {
   SearchFileGroup, SearchMatchesBlockProps, SearchPathsBlockProps,
-} from '../src/index.ts'
+} from '../src/client/index.ts'
 import { searchBlockLabels } from './labels.client.ts'
 
 type SearchBlockProps =
@@ -195,7 +195,7 @@ describe('SearchBlock copy', () => {
     // A second click while the ok label shows is a no-op.
     fireEvent.click(screen.getByRole('button', { name: '复制成功' }))
     expect(writeText).toHaveBeenCalledTimes(1)
-    await vi.advanceTimersByTimeAsync(1000)
+    await act(async () => { await vi.advanceTimersByTimeAsync(1000) })
     expect(screen.getByRole('button', { name: '复制' })).toBeTruthy()
   })
 

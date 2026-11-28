@@ -3,8 +3,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
 import type { ComponentProps } from 'react'
-import { DEFAULT_TERMINAL_MAX_LINES, TerminalBlock as LocalizedTerminalBlock } from '../src/index.ts'
-import { writeClipboard } from '../src/clipboard.ts'
+import { DEFAULT_TERMINAL_MAX_LINES, TerminalBlock as LocalizedTerminalBlock } from '../src/client/index.ts'
+import { writeClipboard } from '../src/client/clipboard.ts'
 import { terminalBlockLabels } from './labels.client.ts'
 
 function TerminalBlock(props: Omit<ComponentProps<typeof LocalizedTerminalBlock>, 'labels'>) {
@@ -411,7 +411,7 @@ describe('TerminalBlock copy', () => {
     // While the ok label is showing, further clicks are no-ops.
     fireEvent.click(screen.getByRole('button', { name: '复制成功' }))
     expect(writeText).toHaveBeenCalledTimes(1)
-    await vi.advanceTimersByTimeAsync(1000)
+    await act(async () => { await vi.advanceTimersByTimeAsync(1000) })
     expect(screen.getByRole('button', { name: '复制' })).toBeTruthy()
   })
 

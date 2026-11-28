@@ -30,17 +30,17 @@
  * domain follows each session's store commits, including sessions off screen.
  */
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
-import type { CSSProperties, ReactNode, RefObject } from 'react'
+import type { CSSProperties, RefObject, ReactNode } from 'react'
 import type { ContextMenuTarget } from '@deepseek-ai/dsh-client-ui-context-menu/client'
 import type { ShortcutCatalogEntry } from '@deepseek-ai/dsh-client-shortcuts/client'
-import { IconPanelLeftOutlineRegular, Tooltip } from '@deepseek-ai/dsh-client-ui-primitives'
+import { IconPanelLeftOutlineRegular, Tooltip } from '@deepseek-ai/dsh-client-ui-primitives/client'
 import type {
   HostObservable, InjectFace, PropsLocale, PropsRenderSlots, PropsRuntime, PropsStore,
-} from '@deepseek-ai/dsh-client-ui-slots'
+} from '@deepseek-ai/dsh-client-ui-slots/client'
 import type {} from '../contract/slots.ts'
-import type { DockIntents, DockMode, DockSurfaceProps, FloatRect, TabId, TabRecord, TabRenderer } from '@deepseek-ai/dsh-client-ui-dockkit'
-import { canSplit, dockPaneIds, DockLayout, findPaneContentTab } from '@deepseek-ai/dsh-client-ui-dockkit'
-import type { HalvesFit, LayoutState, PaneId } from '@deepseek-ai/dsh-client-ui-dockkit'
+import type { DockIntents, DockMode, DockSurfaceProps, FloatRect, TabId, TabRecord, TabRenderer } from '@deepseek-ai/dsh-client-ui-dockkit/client'
+import { canSplit, dockPaneIds, DockLayout, findPaneContentTab } from '@deepseek-ai/dsh-client-ui-dockkit/client'
+import type { HalvesFit, LayoutState, PaneId } from '@deepseek-ai/dsh-client-ui-dockkit/client'
 import type { SessionId } from '@deepseek-ai/dsh-session/types'
 import { GUIDE_KIND, isContentTab, pageAddress } from '../contract/seed.ts'
 import { dockLabels } from '../labels.ts'
@@ -313,7 +313,7 @@ function PanelChrome({ sessionId, fullscreen, actions, t, shortcuts, toggleFulls
  * The panel: the docked surface with the two controls in its top-right strip,
  * anchored to the frame's right edge and slid off it while collapsed.
  */
-function SidebarPanel(panel: PanelProps & { width: number; panelRef: RefObject<HTMLDivElement> }): ReactNode {
+function SidebarPanel(panel: PanelProps & { width: number; panelRef: RefObject<HTMLDivElement | null> }): ReactNode {
   const { sessionId, surface, actions, t, openTab, width, reportRoom, fullscreen, panelRef } = panel
   const { expanded } = surface.layout
   const types = panel.useTabTypes(value => value)

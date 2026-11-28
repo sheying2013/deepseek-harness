@@ -1,8 +1,8 @@
 /** PDF page presentation; binary content and tab information come from the document owner. */
 import { useCallback, useEffect, useRef, useState, type ComponentType, type CSSProperties, type ReactNode } from 'react'
-import { Button } from '@deepseek-ai/dsh-client-ui-primitives'
-import type { PropsLocale, PropsStore } from '@deepseek-ai/dsh-client-ui-slots'
-import type { TabId } from '@deepseek-ai/dsh-client-ui-dockkit'
+import { Button } from '@deepseek-ai/dsh-client-ui-primitives/client'
+import type { PropsLocale, PropsStore } from '@deepseek-ai/dsh-client-ui-slots/client'
+import type { TabId } from '@deepseek-ai/dsh-client-ui-dockkit/client'
 import type { DocumentPreviewProps } from '../document/contract.ts'
 import type { PdfStore, PdfView } from './store.ts'
 import { renderPdfPage, type PdfDocument } from './document.ts'
@@ -118,9 +118,9 @@ function PdfPage({ document, page, requested: initiallyRequested, onVisible, sig
   const [width, setWidth] = useState<number>()
   const [requested, setRequested] = useState(initiallyRequested)
   const [visible, setVisible] = useState(initiallyRequested)
-  const renderedZoom = useRef<number>()
+  const renderedZoom = useRef<number>(undefined)
   const pendingRender = useRef(Promise.resolve())
-  const textTask = useRef<ReturnType<ReturnType<typeof pdfTextRenderer>>>()
+  const textTask = useRef<ReturnType<ReturnType<typeof pdfTextRenderer>>>(undefined)
   const [state, setState] = useState<'loading' | 'ready'>('loading')
   const [failure, setFailure] = useState<{ readonly error: unknown }>()
   const [attempt, setAttempt] = useState(0)

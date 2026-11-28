@@ -9,7 +9,7 @@ import type {
 } from '@deepseek-ai/dsh-deepseek-account/types'
 import type { QuotaNoticeOwnerProps } from '@deepseek-ai/dsh-client-ui-chat/client'
 import type { ThemeRuntime } from '@deepseek-ai/dsh-client-ui-theme/client'
-import { resolveSlotLabel } from '@deepseek-ai/dsh-client-ui-slots'
+import { resolveSlotLabel } from '@deepseek-ai/dsh-client-ui-slots/client'
 import type { JsonValue } from '@deepseek-ai/dsh-util-values'
 import { Config as OnboardingConfig } from '../src/index.ts'
 import { ChatSettingsSchema as ChatConfig } from '../../ui-chat/src/chat-settings.ts'
@@ -76,6 +76,20 @@ withoutAccountAccess('opens no account stream and registers no account surface w
   expect(quotaNoticeEntry(c)).toBeUndefined()
   expect(c.ctx.slots.entries('settings.models.sign-in')).toHaveLength(0)
   expect(c.ctx.slots.entries('settings.section').some(entry => entry.options.id === 'account')).toBe(false)
+  expect(c.ctx.get('accountSignIn')).toBeUndefined()
+}, 60_000)
+
+it('lets other plugins open sign-in from a click and withdraws the entry on unload', async ({ start, mock }) => {
+  const open = vi.spyOn(window, 'open').mockReturnValue(null)
+  const c = await start()
+  mock.remote.account.startSignIn.mockResolvedValueOnce({ ok: false, error: new RemoteError('gateway/internal', 'offline', {}) })
+  c.ctx.get('accountSignIn')!.open()
+  // The tab preopens synchronously inside the caller's click, before the Host responds.
+  expect(open).toHaveBeenCalledOnce()
+  expect(operations(c).hooks.account.getSnapshot()).toMatchObject({ loginVisible: true })
+  await vi.waitFor(() => { expect(operations(c).hooks.account.getSnapshot()).toMatchObject({ loginFailed: true }) })
+  await c.unload(SELF)
+  expect(c.ctx.get('accountSignIn')).toBeUndefined()
 }, 60_000)
 
 it('claims account balance notices from the frame-wide quota chain and declines generic quota', async ({ start }) => {
@@ -98,16 +112,8 @@ it('shares account actions across seats, publishes dialog ownership, and opens c
   const c = await start()
   const actions = operations(c)
   expect(c.ctx.slots.entries('settings.models.sign-in')[0]!.inject!()).toBe(actions)
-  // The account UI follows the live theme service through the framework hook channel.
-  const theme = c.ctx.get('theme') as ThemeRuntime
-  const onTheme = vi.fn()
-  const offTheme = actions.hooks.theme.subscribe(onTheme)
-  expect(actions.hooks.theme.getSnapshot()).toBe(theme.getTheme())
-  const probe = theme.register({ id: 'probe', colorScheme: 'dark', tokens: {} })
-  expect(onTheme).toHaveBeenCalledOnce()
-  probe()
-  offTheme()
-  expect(theme.getTheme().themes.map(candidate => candidate.id)).toEqual(['light', 'dark'])
+  // The account UI reads the theme through the global `useTheme` standard prop, not an injected source.
+  expect(actions.hooks).not.toHaveProperty('theme')
   await actions.refreshAccount()
   expect(c.mock.remote.account.getProfile).not.toHaveBeenCalled()
   const listener = vi.fn()
