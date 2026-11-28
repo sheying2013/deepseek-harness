@@ -18,6 +18,8 @@ jobs:
   keepalive:
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
       - name: Keep automation workflows enabled
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -31,6 +33,6 @@ jobs:
           if [ "$BUILD_STATE" != "active" ]; then
             gh api --method PUT "repos/${GITHUB_REPOSITORY}/actions/workflows/370482055/enable"
           fi
-          if [ "${{ inputs.dispatch_sync || true }}" = "true" ]; then
+          if [ "${{ inputs.dispatch_sync }}" != "false" ]; then
             gh workflow run fork-sync-upstream.yml --ref master
           fi
