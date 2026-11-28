@@ -11,7 +11,10 @@
 | 工作流文件 | 显示名称 | 运行环境 | 默认触发方式 | 核心职责 |
 | :--- | :--- | :--- | :--- | :--- |
 | `fork-sync-upstream.yml` | `Sync Upstream & Trigger Build` | `ubuntu-latest` | 每 10 分钟 / 手动 `workflow_dispatch` / `repository_dispatch` | 同步 master/tags，轮询上游 DSH Releases，并排队调用 x64 构建 |
+| `fork-keepalive.yml` | `Workflow Keepalive` | `ubuntu-latest` | 每天 00:17 UTC / 手动 `workflow_dispatch` | 重新启用同步与构建工作流，并触发一次上游检查 |
 | `fork-macos-x64.yml` | `Build macOS x64 Desktop App` | `macos-15-intel` | 手动 `workflow_dispatch` / 可复用 `workflow_call` | 构建指定上游 Release tag、四重验收、Artifact 与 fork Release 发布 |
+
+`fork-keepalive.yml` 用于防止 GitHub 因仓库长时间无活动而自动禁用定时工作流。它每天运行一次，重新启用同步与构建工作流并触发上游检查。
 
 ---
 

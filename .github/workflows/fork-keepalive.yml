@@ -1,0 +1,36 @@
+name: Workflow Keepalive
+
+on:
+  schedule:
+    - cron: '17 0 * * *'
+  workflow_dispatch:
+    inputs:
+      dispatch_sync:
+        description: 'Dispatch upstream synchronization after enabling workflows'
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  actions: write
+
+jobs:
+  keepalive:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Keep automation workflows enabled
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          SYNC_STATE=$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/370482057" --jq '.state')
+          if [ "$SYNC_STATE" != "active" ]; then
+            gh api --method PUT "repos/${GITHUB_REPOSITORY}/actions/workflows/370482057/enable"
+          fi
+          BUILD_STATE=$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/370482055" --jq '.state')
+          if [ "$BUILD_STATE" != "active" ]; then
+            gh api --method PUT "repos/${GITHUB_REPOSITORY}/actions/workflows/370482055/enable"
+          fi
+          if [ "${{ inputs.dispatch_sync || true }}" = "true" ]; then
+            gh workflow run fork-sync-upstream.yml --ref master
+          fi
